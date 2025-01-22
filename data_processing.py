@@ -4,12 +4,11 @@ import torch
 import numpy as np
 import pandas as pd
 import os.path as op
+import re
 
-from utils.common import get_mgrid
+from torch.utils.data import Dataset, DataLoader
 
-from torch.utils.data import Dataset, TensorDataset, DataLoader
-
-device = 'cpu'  # 'cuda' or 'cpu'
+device = 'cpu'  # or 'cuda' if you prefer
 Xvars = ['hx', 'hy', 'hz', 'dx', 'dy', 'dz']
 Yvars = ['brdf_r', 'brdf_g', 'brdf_b']
 
@@ -33,12 +32,58 @@ def brdf_to_rgb(rvectors, brdf):
     return rgb
 
 
+def generate_nn_datasets(brdf, nsamples, dataset='MERL', pct=1):
+    """
+    Samples random half/difference angles, evaluates BRDF vs. 'median'.
+    Returns a DataFrame with columns Xvars + Yvars.
+    """
+    rangles = np.random.uniform([0, 0, 0], [np.pi / 2., np.pi / 2., 2 * np.pi], [int(nsamples * pct), 3]).T
+    rangles[2] = common.normalize_phid(rangles[2])
+    rvectors = coords.rangles_to_rvectors(*rangles)
+
+    if dataset == 'MERL':
+        median = fastmerl.Merl('data/merl_median.binary')
+        median_vals = brdf_values(rvectors, brdf=median)
+    elif dataset == 'EPFL':
+        median_np = np.load('epfl_median.npy')
+        any_fullbin = 'brdf.fullbin'
+        median = fastmerl.Merl(any_fullbin)
+        median.from_array(median_np)
+        median.brdf_np = np.array(median.brdf)
+        median.sampling_phi_d = 180
+        median_vals = brdf_values(rvectors, brdf=median)
+    else:
+        raise ValueError("Unsupported dataset type")
+
+    brdf_vals = brdf_values(rvectors, brdf=brdf)
+    normalized_brdf_vals = np.log(1 + ((brdf_vals + 0.002) / (median_vals + 0.002)))
+
+    df = pd.DataFrame(np.concatenate([rvectors.T, normalized_brdf_vals], axis=1), columns=[*Xvars, *Yvars])
+    df = df[(df.T != 0).any()]
+    df = df.drop(df[df['brdf_r'] < 0].index)
+    return df
+
+
+def brdf_values(rvectors, brdf=None, model=None):
+    if brdf is not None:
+        rangles = coords.rvectors_to_rangles(*rvectors)
+        brdf_arr = brdf.eval_interp(*rangles).T
+    elif model is not None:
+        raise RuntimeError("Model-based path not currently used in this snippet.")
+    else:
+        raise NotImplementedError("Need a BRDF or model to evaluate reflectance.")
+    brdf_arr *= common.mask_from_array(rvectors.T).reshape(-1, 1)
+    return brdf_arr
+
+
 class EPFL(Dataset):
+    """
+    Provided as-is in your snippet, for reference with .csv files.
+    """
     def __init__(self, merlPath):
         super(EPFL, self).__init__()
         self.fnames = glob.glob(op.join(merlPath, "*.csv"))
         self.train_coords, self.train_brdfvals = [], []
-
         self.brdfs = []
 
         for fname in self.fnames:
@@ -65,74 +110,71 @@ class EPFL(Dataset):
         return len(self.fnames)
 
     def __getitem__(self, idx):
-        in_dict = {'idx': idx, 'coords': self.train_coords[idx], 'amps': self.train_brdfvals[idx]}
+        in_dict = {
+            'coords': self.train_coords[idx],
+            'amps': self.train_brdfvals[idx]
+        }
         gt_dict = {'amps': self.train_brdfvals[idx]}
         return in_dict, gt_dict
 
 
 class MerlDataset(Dataset):
+    """
+    Modified to parse thickness/doping from each filename (e.g. "nano_XYZBRDF160nmD50nm.binary").
+    We store them in self.params, then include them in 'in_dict' or 'model_in' in __getitem__.
+    """
     def __init__(self, merlPath):
         super(MerlDataset, self).__init__()
-        self.fnames = glob.glob(op.join(merlPath, "*.binary"))  # [:10]
-        self.train_coords, self.train_brdfvals = [], []
-
+        self.fnames = glob.glob(op.join(merlPath, "*.binary"))
+        self.train_coords = []
+        self.train_brdfvals = []
+        self.params = []  # (ADDED) We'll store [thickness, doping] for each file
         self.brdfs = []
 
         for fname in self.fnames:
+            # (ADDED) parse thickness/doping from filename
+            base = os.path.basename(fname)
+            match = re.match(r'nano_XYZBRDF(\d+)nmD(\d+)nm', base)
+            if match:
+                thickness = float(match.group(1))
+                doping = float(match.group(2))
+            else:
+                thickness = 0.0
+                doping = 0.0
+            self.params.append([thickness, doping])
+
+            # (original) read the BRDF via fastmerl
             BRDF = fastmerl.Merl(fname)
+
+            # generate random samples, get normalized BRDF
             reflectance_train = generate_nn_datasets(BRDF, nsamples=180*90*90, dataset='MERL', pct=1)
             self.train_coords.append(reflectance_train[Xvars].values)
             self.train_brdfvals.append(reflectance_train[Yvars].values)
             print(fname)
+
+        # Convert everything to torch
         self.train_coords = [torch.tensor(arr, dtype=torch.float32, device=device) for arr in self.train_coords]
         self.train_brdfvals = [torch.tensor(arr, dtype=torch.float32, device=device) for arr in self.train_brdfvals]
+        self.params = [torch.tensor(arr, dtype=torch.float32, device=device) for arr in self.params]
 
     def __len__(self):
         return len(self.fnames)
 
     def __getitem__(self, idx):
-        in_dict = {'idx': idx, 'coords': self.train_coords[idx], 'amps': self.train_brdfvals[idx]}
-        gt_dict = {'amps': self.train_brdfvals[idx]}
+        coords_torch = self.train_coords[idx]      # [N,6]
+        brdfvals_torch = self.train_brdfvals[idx]  # [N,3]
+        param_torch = self.params[idx]             # [2]
+
+        # IMPORTANT: We now include 'amps' in the first dict
+        in_dict = {
+            "coords": coords_torch,   
+            "amps": brdfvals_torch,   # <-- ADDED so model_input['amps'] works
+            "params": param_torch
+        }
+
+        # The second dict is still your ground-truth, 
+        # which also has 'amps' if you like
+        gt_dict = {
+            "amps": brdfvals_torch
+        }
         return in_dict, gt_dict
-
-
-def generate_nn_datasets(brdf, nsamples, dataset, pct=1):
-
-    rangles = np.random.uniform([0, 0, 0], [np.pi / 2., np.pi / 2., 2 * np.pi], [int(nsamples * pct), 3]).T
-    rangles[2] = common.normalize_phid(rangles[2])
-    rvectors = coords.rangles_to_rvectors(*rangles)
-
-    if dataset == 'MERL':
-        median = fastmerl.Merl('data/merl_median.binary')
-        median_vals = brdf_values(rvectors, brdf=median)
-
-    elif dataset == 'EPFL':
-        median_np = np.load('epfl_median.npy')
-        any_fullbin = 'brdf.fullbin'
-        median = fastmerl.Merl(any_fullbin)
-        median.from_array(median_np)
-        median.brdf_np = np.array(median.brdf)
-        median.sampling_phi_d = 180
-        median_vals = brdf_values(rvectors, brdf=median)
-
-    brdf_vals = brdf_values(rvectors, brdf=brdf)
-    normalized_brdf_vals = np.log(1 + ((brdf_vals + 0.002) / (median_vals + 0.002)))
-
-    df = pd.DataFrame(np.concatenate([rvectors.T, normalized_brdf_vals], axis=1), columns=[*Xvars, *Yvars])
-    df = df[(df.T != 0).any()]
-    df = df.drop(df[df['brdf_r'] < 0].index)
-    return df
-
-
-def brdf_values(rvectors, brdf=None, model=None):
-    if brdf is not None:
-        rangles = coords.rvectors_to_rangles(*rvectors)
-        brdf_arr = brdf.eval_interp(*rangles).T
-    elif model is not None:
-        # brdf_arr = model.predict(rvectors.T)        # nnModule has no .predict
-        raise RuntimeError("Should not have entered that branch at all from the original code")
-    else:
-        raise NotImplementedError("Something went really wrong.")
-    brdf_arr *= common.mask_from_array(rvectors.T).reshape(-1, 1)
-    return brdf_arr
-

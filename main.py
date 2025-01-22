@@ -6,92 +6,117 @@ import argparse
 from functools import partial
 from sklearn.metrics import mean_squared_error
 
-from utils.common import *
-from models import *
-from data_processing import *
+import torch
+import numpy as np
+import pandas as pd
+import os.path as op
 
+from utils.common import get_device, create_directory
+from models import HyperBRDF
+from data_processing import MerlDataset, EPFL
+from torch.utils.data import DataLoader
 
 def brdf_to_rgb(rvectors, brdf):
-    hx = torch.reshape(rvectors[:, :, 0], (-1, 1))
-    hy = torch.reshape(rvectors[:, :, 1], (-1, 1))
-    hz = torch.reshape(rvectors[:, :, 2], (-1, 1))
-    dx = torch.reshape(rvectors[:, :, 3], (-1, 1))
-    dy = torch.reshape(rvectors[:, :, 4], (-1, 1))
-    dz = torch.reshape(rvectors[:, :, 5], (-1, 1))
+    """
+    Expects:
+      rvectors: [B, N, 6]   -> (hx, hy, hz, dx, dy, dz)
+      brdf:     [B, N, 3]   -> per-sample reflectance
+    Returns:
+      out_rgb:  [B, N, 3]
+    """
+    hx = rvectors[..., 0]  # shape [B, N]
+    hy = rvectors[..., 1]
+    hz = rvectors[..., 2]
+    dx = rvectors[..., 3]
+    dy = rvectors[..., 4]
+    dz = rvectors[..., 5]
 
-    theta_h = torch.atan2(torch.sqrt(hx ** 2 + hy ** 2), hz)
-    theta_d = torch.atan2(torch.sqrt(dx ** 2 + dy ** 2), dz)
-    phi_d = torch.atan2(dy, dx)
-    wiz = torch.cos(theta_d) * torch.cos(theta_h) - \
-          torch.sin(theta_d) * torch.cos(phi_d) * torch.sin(theta_h)
-    rgb = brdf * torch.clamp(wiz, 0, 1)
-    return rgb
+    theta_h = torch.atan2(torch.sqrt(hx**2 + hy**2), hz)  # [B, N]
+    theta_d = torch.atan2(torch.sqrt(dx**2 + dy**2), dz)
+    phi_d   = torch.atan2(dy, dx)
+
+    wiz = (torch.cos(theta_d) * torch.cos(theta_h)
+           - torch.sin(theta_d) * torch.cos(phi_d) * torch.sin(theta_h))  # [B, N]
+
+    # Expand wiz from [B, N] -> [B, N, 1] so it can multiply [B, N, 3]
+    wiz_expanded = torch.clamp(wiz, 0, 1).unsqueeze(-1)  # [B, N, 1]
+    return brdf * wiz_expanded  # shape [B, N, 3]
 
 
 def image_mse(model_output, gt):
-    return {'img_loss': ((brdf_to_rgb(model_output['model_in'], model_output['model_out'])
-                          - brdf_to_rgb(model_output['model_in'], gt['amps'])) ** 2).mean()}
+    # Suppose model_output['model_in'] is [N,6], we do unsqueeze(0) => [1,N,6]
+    pred_dirs = model_output['model_in'].unsqueeze(0)
+    pred_brdf = model_output['model_out'].unsqueeze(0)
+    gt_brdf   = gt['amps'].unsqueeze(0)
+    
+    # Now pass them to brdf_to_rgb
+    rgb_pred = brdf_to_rgb(pred_dirs, pred_brdf)  # => [1,N,3]
+    rgb_gt   = brdf_to_rgb(pred_dirs, gt_brdf)
+    return {'img_loss': (rgb_pred - rgb_gt).pow(2).mean()}
 
 
 def latent_loss(model_output):
+    """
+    Weighted norm of the embedding from set_encoder
+    """
     return torch.mean(model_output['latent_vec'] ** 2)
 
-
 def hypo_weight_loss(model_output):
+    """
+    Weighted norm of hypernetwork-predicted weights
+    """
     weight_sum = 0
     total_weights = 0
-
     for weight in model_output['hypo_params'].values():
         weight_sum += torch.sum(weight ** 2)
         total_weights += weight.numel()
-
-    return weight_sum * (1 / total_weights)
-
+    return weight_sum * (1.0 / total_weights)
 
 def image_hypernetwork_loss(kl, fw, model_output, gt):
-    return {'img_loss': image_mse(model_output, gt)['img_loss'],
-            'latent_loss': kl * latent_loss(model_output),
-            'hypo_weight_loss': fw * hypo_weight_loss(model_output)}
+    """
+    Combine image MSE, latent regularization, and hypernetwork-weight regularization.
+    """
+    losses = {}
+    losses.update(image_mse(model_output, gt))  # 'img_loss'
+    losses['latent_loss']      = kl * latent_loss(model_output)
+    losses['hypo_weight_loss'] = fw * hypo_weight_loss(model_output)
+    return losses
 
-
-def eval_epoch(model, train_dataloader, loss_fn, optim, epoch):
+def eval_epoch(model, dataloader, loss_fn, optim, epoch):
     epoch_loss = []
     individual_loss = []
-    for step, (model_input, gt) in enumerate(train_dataloader):
-        model.eval()
-        model_input = {key: value.to(device) for key, value in model_input.items()}
-        gt = {key: value.to(device) for key, value in gt.items()}
+    model.eval()
 
-        model_output = model(model_input)
-        losses = loss_fn(model_output, gt)
+    with torch.no_grad():
+        for step, (model_input, gt) in enumerate(dataloader):
+            # Move to device
+            model_input = {k: v.to(device) for k,v in model_input.items()}
+            gt = {k: v.to(device) for k,v in gt.items()}
 
-        train_loss = 0.
-        for loss_name, loss in losses.items():
-            single_loss = loss.mean()
-            train_loss += single_loss
-        individual_loss.append([loss.cpu().detach().numpy() for loss_name, loss in losses.items()])
-        epoch_loss.append(train_loss.item())
+            model_output = model(model_input)
+            losses = loss_fn(model_output, gt)
+
+            total_loss = 0.
+            for _, val in losses.items():
+                total_loss += val.item()
+            epoch_loss.append(total_loss)
+            individual_loss.append([val.item() for val in losses.values()])
+
     return np.mean(epoch_loss), np.stack(individual_loss).mean(axis=0)
 
-
-# Epoch training
-def train_epoch(model, train_dataloader, loss_fn, optim, epoch):
+def train_epoch(model, dataloader, loss_fn, optim, epoch):
     epoch_loss = []
     individual_loss = []
-    for step, (model_input, gt) in enumerate(train_dataloader):
-        model.train()
-        model_input = {key: value.to(device) for key, value in model_input.items()}
+    model.train()
 
-        gt = {key: value.to(device) for key, value in gt.items()}
+    for step, (model_input, gt) in enumerate(dataloader):
+        model_input = {k: v.to(device) for k, v in model_input.items()}
+        gt = {k: v.to(device) for k, v in gt.items()}
+
         model_output = model(model_input)
         losses = loss_fn(model_output, gt)
-        # print('step:', step, 'epoch:', epoch, 'bin_path:')
 
-        train_loss = 0.
-        for loss_name, loss in losses.items():
-            single_loss = loss.mean()
-            train_loss += single_loss
-        individual_loss.append([loss.cpu().detach().numpy() for loss_name, loss in losses.items()])
+        train_loss = sum(losses.values())
         optim.zero_grad()
         train_loss.backward()
 
@@ -100,31 +125,37 @@ def train_epoch(model, train_dataloader, loss_fn, optim, epoch):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.)
             else:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad)
+
         optim.step()
         epoch_loss.append(train_loss.item())
+        individual_loss.append([v.item() for v in losses.values()])
+
     return np.mean(epoch_loss), np.stack(individual_loss).mean(axis=0)
 
-
 def eval_model(model, dataloader, path_=None, name=''):
+    """
+    Example usage. You can ignore or keep as needed.
+    """
     model_inp = []
     model_out = []
-    for step, (model_input, gt) in enumerate(dataloader):
-        model.eval()
-        model_input = {key: value.to(device) for key, value in model_input.items()}
-        gt = {key: value.to(device) for key, value in gt.items()}
-        model_output = model(model_input)
-        model_out.append(model_output['model_out'].cpu().detach().numpy())
-        model_inp.append(gt['amps'].cpu().numpy())
-    y_true = np.concatenate(model_inp)
-    y_true = y_true[:, :, 0]
-    y_pred = np.concatenate(model_out)
-    y_pred = y_pred[:, :, 0]
-    mse = mean_squared_error(y_true, y_pred)
-    return mse
+    model.eval()
+
+    with torch.no_grad():
+        for step, (model_input, gt) in enumerate(dataloader):
+            model_input = {k: v.to(device) for k,v in model_input.items()}
+            gt = {k: v.to(device) for k,v in gt.items()}
+            out = model(model_input)
+            model_out.append(out['model_out'].cpu().numpy())
+            model_inp.append(gt['amps'].cpu().numpy())
+
+    y_true = np.concatenate(model_inp)[:, :, 0]
+    y_pred = np.concatenate(model_out)[:, :, 0]
+    return mean_squared_error(y_true, y_pred)
 
 
 ######################################################################################
-
+# MAIN
+######################################################################################
 parser = argparse.ArgumentParser('')
 parser.add_argument('--destdir', dest='destdir', type=str, required=True, help='output directory')
 parser.add_argument('--binary', type=str, required=True, help='dataset path')
@@ -137,7 +168,7 @@ parser.add_argument('--keepon', type=bool, default=False, help='continue trainin
 
 args = parser.parse_args()
 device = get_device()
-print(device)
+print("Running on device:", device)
 
 path_ = op.join(args.destdir, args.dataset)
 create_directory(path_)
@@ -146,48 +177,52 @@ create_directory(op.join(path_, 'img'))
 with open(op.join(path_, 'args.txt'), 'w') as f:
     json.dump(args.__dict__, f, indent=2)
 
-#### Set hyperparameters
+# (CHANGED) Hyperparameters
 kl_weight = args.kl_weight
 fw_weight = args.fw_weight
 
 loss_fn = partial(image_hypernetwork_loss, kl_weight, fw_weight)
-
 clip_grad = True
 lr = args.lr
 epochs = args.epochs
 binary = args.binary
 
+# (CHANGED) Load dataset that returns { 'coords', 'amps', 'params' }
 if args.dataset == 'MERL':
     dataset = MerlDataset(binary)
     dataloader = DataLoader(dataset, shuffle=True, batch_size=1)
-
 elif args.dataset == 'EPFL':
     dataset = EPFL(binary)
     dataloader = DataLoader(dataset, shuffle=True, batch_size=1)
 
-
-#### Train model
-start_time = time.time()
-# Start training model
+# (CHANGED) Use the new HyperBRDF that expects [coords, amps, params]
+# If your SingleBVPNet uses in_features=6, keep in_features=6 here.
 if args.keepon:
     model = torch.load(op.join(path_, 'checkpoint.pt'))
+    print("Continuing from existing checkpoint.")
 else:
     model = HyperBRDF(in_features=6, out_features=3).to(device)
+
+# Prepare optimizer
+optim = torch.optim.Adam(model.parameters(), lr=lr)
+
+# Evaluate initial model
 train_losses, all_losses = [], []
-optim = torch.optim.Adam(lr=lr, params=model.parameters())
-epoch_loss, individual_losses = eval_epoch(model, dataloader, loss_fn, optim, 0)
-train_losses.append(epoch_loss)
-all_losses.append(individual_losses)
-print('init', epoch_loss, all_losses)
+init_loss, init_indiv = eval_epoch(model, dataloader, loss_fn, optim, 0)
+train_losses.append(init_loss)
+all_losses.append(init_indiv)
+print(f"Initial Loss = {init_loss}, components = {init_indiv}")
 
+# Train
 for epoch in range(epochs):
-    epoch_loss, individual_losses = train_epoch(model, dataloader, loss_fn, optim, epoch)
-    train_losses.append(epoch_loss)
-    all_losses.append(individual_losses)
-    print(epoch, epoch_loss, all_losses)
+    e_loss, e_indiv = train_epoch(model, dataloader, loss_fn, optim, epoch)
+    train_losses.append(e_loss)
+    all_losses.append(e_indiv)
+    print(f"Epoch {epoch}/{epochs} - Loss = {e_loss:.6f}")
 
-# Save training losses, and trained model
+# Save logs, model
 pd.DataFrame(train_losses).to_csv(op.join(path_, 'train_loss.csv'))
 pd.DataFrame(all_losses).to_csv(op.join(path_, 'all_losses.csv'))
 torch.save(model, op.join(path_, 'checkpoint.pt'))
-#### Finish training
+
+print("Training complete. Model saved.")
