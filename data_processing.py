@@ -26,8 +26,10 @@ def brdf_to_rgb(rvectors, brdf):
     theta_h = np.arctan2(np.sqrt(hx ** 2 + hy ** 2), hz)
     theta_d = np.arctan2(np.sqrt(dx ** 2 + dy ** 2), dz)
     phi_d = np.arctan2(dy, dx)
-    wiz = np.cos(theta_d) * np.cos(theta_h) - \
-          np.sin(theta_d) * np.cos(phi_d) * np.sin(theta_h)
+    wiz = (
+        np.cos(theta_d) * np.cos(theta_h)
+        - np.sin(theta_d) * np.cos(phi_d) * np.sin(theta_h)
+    )
     rgb = brdf * np.clip(wiz, 0, 1)
     return rgb
 
@@ -58,7 +60,10 @@ def generate_nn_datasets(brdf, nsamples, dataset='MERL', pct=1):
     brdf_vals = brdf_values(rvectors, brdf=brdf)
     normalized_brdf_vals = np.log(1 + ((brdf_vals + 0.002) / (median_vals + 0.002)))
 
-    df = pd.DataFrame(np.concatenate([rvectors.T, normalized_brdf_vals], axis=1), columns=[*Xvars, *Yvars])
+    df = pd.DataFrame(
+        np.concatenate([rvectors.T, normalized_brdf_vals], axis=1),
+        columns=[*Xvars, *Yvars]
+    )
     df = df[(df.T != 0).any()]
     df = df.drop(df[df['brdf_r'] < 0].index)
     return df
@@ -97,14 +102,25 @@ class EPFL(Dataset):
             merl.from_array(amps)
             merl.brdf_np = np.array(merl.brdf)
             merl.sampling_phi_d = 180
-            reflectance_train = generate_nn_datasets(merl, nsamples=180 * 90 * 90, dataset='EPFL', pct=1)
+            reflectance_train = generate_nn_datasets(
+                merl, 
+                nsamples=180 * 90 * 90, 
+                dataset='EPFL', 
+                pct=1
+            )
 
             self.train_coords.append(reflectance_train[Xvars].values)
             self.train_brdfvals.append(reflectance_train[Yvars].values)
             print(fname)
 
-        self.train_coords = [torch.tensor(arr, dtype=torch.float32, device=device) for arr in self.train_coords]
-        self.train_brdfvals = [torch.tensor(arr, dtype=torch.float32, device=device) for arr in self.train_brdfvals]
+        self.train_coords = [
+            torch.tensor(arr, dtype=torch.float32, device=device)
+            for arr in self.train_coords
+        ]
+        self.train_brdfvals = [
+            torch.tensor(arr, dtype=torch.float32, device=device)
+            for arr in self.train_brdfvals
+        ]
 
     def __len__(self):
         return len(self.fnames)
@@ -112,7 +128,9 @@ class EPFL(Dataset):
     def __getitem__(self, idx):
         in_dict = {
             'coords': self.train_coords[idx],
-            'amps': self.train_brdfvals[idx]
+            'amps': self.train_brdfvals[idx],
+            # NEW: add 'idx' so test.py can do model_input['idx']
+            'idx': idx
         }
         gt_dict = {'amps': self.train_brdfvals[idx]}
         return in_dict, gt_dict
@@ -128,11 +146,11 @@ class MerlDataset(Dataset):
         self.fnames = glob.glob(op.join(merlPath, "*.binary"))
         self.train_coords = []
         self.train_brdfvals = []
-        self.params = []  # (ADDED) We'll store [thickness, doping] for each file
+        self.params = []  # We'll store [thickness, doping] for each file
         self.brdfs = []
 
         for fname in self.fnames:
-            # (ADDED) parse thickness/doping from filename
+            # parse thickness/doping from filename
             base = os.path.basename(fname)
             match = re.match(r'nano_XYZBRDF(\d+)nmD(\d+)nm', base)
             if match:
@@ -143,19 +161,33 @@ class MerlDataset(Dataset):
                 doping = 0.0
             self.params.append([thickness, doping])
 
-            # (original) read the BRDF via fastmerl
+            # read the BRDF via fastmerl
             BRDF = fastmerl.Merl(fname)
 
             # generate random samples, get normalized BRDF
-            reflectance_train = generate_nn_datasets(BRDF, nsamples=180*90*90, dataset='MERL', pct=1)
+            reflectance_train = generate_nn_datasets(
+                BRDF, 
+                nsamples=180*90*90, 
+                dataset='MERL', 
+                pct=1
+            )
             self.train_coords.append(reflectance_train[Xvars].values)
             self.train_brdfvals.append(reflectance_train[Yvars].values)
             print(fname)
 
         # Convert everything to torch
-        self.train_coords = [torch.tensor(arr, dtype=torch.float32, device=device) for arr in self.train_coords]
-        self.train_brdfvals = [torch.tensor(arr, dtype=torch.float32, device=device) for arr in self.train_brdfvals]
-        self.params = [torch.tensor(arr, dtype=torch.float32, device=device) for arr in self.params]
+        self.train_coords = [
+            torch.tensor(arr, dtype=torch.float32, device=device)
+            for arr in self.train_coords
+        ]
+        self.train_brdfvals = [
+            torch.tensor(arr, dtype=torch.float32, device=device)
+            for arr in self.train_brdfvals
+        ]
+        self.params = [
+            torch.tensor(arr, dtype=torch.float32, device=device)
+            for arr in self.params
+        ]
 
     def __len__(self):
         return len(self.fnames)
@@ -165,15 +197,13 @@ class MerlDataset(Dataset):
         brdfvals_torch = self.train_brdfvals[idx]  # [N,3]
         param_torch = self.params[idx]             # [2]
 
-        # IMPORTANT: We now include 'amps' in the first dict
         in_dict = {
             "coords": coords_torch,   
-            "amps": brdfvals_torch,   # <-- ADDED so model_input['amps'] works
-            "params": param_torch
+            "amps": brdfvals_torch,  # needed so model_input['amps'] works
+            "params": param_torch,
+            # NEW: add 'idx' so test.py can do model_input['idx']
+            "idx": idx
         }
-
-        # The second dict is still your ground-truth, 
-        # which also has 'amps' if you like
         gt_dict = {
             "amps": brdfvals_torch
         }
