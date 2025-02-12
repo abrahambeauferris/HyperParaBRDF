@@ -1,0 +1,10 @@
+{
+  "destdir": "results/nano2",
+  "binary": "data/nano",
+  "dataset": "MERL",
+  "kl_weight": 0.0,
+  "fw_weight": 0.0,
+  "epochs": 80,
+  "lr": 5e-05,
+  "keepon": false
+}
