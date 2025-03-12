@@ -4,217 +4,282 @@ import sys
 import numpy as np
 
 def convert_zemax_to_epfl(zmx_text, output_path):
-    # first we take each line from the zemax file
-    # we ignore empty lines or lines that start with a comment symbol
-    lines = [ln.strip() for ln in zmx_text.splitlines() if ln.strip() and not ln.strip().startswith('#')]
+
+    # first, read each line but skip empties and ones starting with '#'
+    lines = [ln.strip() for ln in zmx_text.splitlines()
+             if ln.strip() and not ln.strip().startswith('#')]
     it = iter(lines)
 
-    # the file starts with info about source, symmetry, spectrum type, and brdf/btdf
+    # zemax header lines we expect: source, symmetry, spectrum type, scatter type
     source = next(it).split()[1]
     symmetry = next(it).split()[1]
     spectral_content = next(it).split()[1]
     scatter_type = next(it).split()[1]
 
-    # next we get the count of sample rotations and incidence angles plus their values
+    # next, lines for rotation angles and incidence angles
     rot_count = int(next(it).split()[1])
     rot_values = list(map(float, next(it).split()))
+
     ang_count = int(next(it).split()[1])
     ang_values = list(map(float, next(it).split()))
 
-    # same for azimuth and radial angles, which describe how light scatters
+    # then we have how many az and radial angles plus their actual angle lists
     az_count = int(next(it).split()[1])
     az_values = list(map(float, next(it).split()))
     rad_count = int(next(it).split()[1])
     rad_values = list(map(float, next(it).split()))
 
-    # if it's xyz or tristimulus, we'll expect three data blocks
-    blocks = []
+    # figure out how many channels blocks we should read (xyz if 3, else 1)
     if spectral_content.lower() in ('xyz', 'tristimulus'):
         expected_blocks = ["TristimulusX", "TristimulusY", "TristimulusZ"]
     else:
-        expected_blocks = [None]  # just one block for monochrome
+        expected_blocks = [None]
 
-    # now we read each data block
+    blocks = []
     for label in expected_blocks:
-        # if we see a label line (like "TristimulusX"), skip it
         line = next(it)
         if label and line.startswith(label):
             line = next(it)
-
-        # we expect a "DataBegin" line to start the data section
+        while not line.startswith("DataBegin"):
+            line = next(it).strip()
         assert line.startswith("DataBegin")
 
         block_data = {'TIS': [], 'values': {}}
-
-        # for each rotation and incidence angle, read tis and the grid of bsdf values
         for r in range(rot_count):
-            for m in range(ang_count):
-                # tis line tells us how much light is scattered overall
+            for a in range(ang_count):
                 tis_line = next(it)
                 assert tis_line.lower().startswith("tis")
                 tis_val = float(tis_line.split()[1])
                 block_data['TIS'].append(tis_val)
 
-                # now we read az_count rows, each with radial data, until we have enough entries
                 matrix = []
-                for i in range(az_count):
+                for _ in range(az_count):
                     row_vals = []
                     while len(row_vals) < rad_count:
                         data_line = next(it)
                         if data_line.lower().startswith("dataend"):
                             break
                         row_vals += list(map(float, data_line.split()))
-                    # pad row if it's short
                     row_vals = row_vals[:rad_count] + [0.0]*(max(0, rad_count - len(row_vals)))
                     matrix.append(row_vals)
 
-                block_data['values'][(r, m)] = np.array(matrix, dtype=np.float32)
-
+                block_data['values'][(r, a)] = np.array(matrix, dtype=np.float32)
         blocks.append(block_data)
-        # eventually we hit a "DataEnd" line but the loop logic mostly handles it
 
-    # now we set up arrays for the epfl format, calling our rotation angles phi_i and incidence angles theta_i
-    phi_i = np.array(rot_values, dtype=np.float32)
-    theta_i = np.array(ang_values, dtype=np.float32)
-    num_phi, num_theta = rot_count, ang_count
+    # interpret rotation angles as theta, incidence angles as phi
+    theta_i = np.array(rot_values, dtype=np.float32)
+    phi_i   = np.array(ang_values, dtype=np.float32)
+    num_theta, num_phi = rot_count, ang_count
 
-    # figure out how many channels we have (1 for mono, 3 for xyz), assign placeholder wavelengths
+    # if we have 3 channels => xyz, else 1 channel
     num_channels = len(blocks)
     if num_channels == 3:
         wavelengths = np.array([650.0, 550.0, 450.0], dtype=np.float32)
     else:
         wavelengths = np.array([555.0], dtype=np.float32)
 
-    # epfl format uses a square grid n x n, so let's figure out the needed size
-    N = max(az_count, rad_count)
+    # build 'spectra' => shape (theta, phi, channels, rad, az)
+    spectra = np.zeros((num_theta, num_phi, num_channels, rad_count, az_count), dtype=np.float32)
+    sigma = np.zeros((num_theta, num_phi), dtype=np.float32)
 
-    # we might need to pad azimuth or radial arrays if they're shorter than n
-    az_list = np.array(az_values, dtype=np.float64)
-    rad_list = np.array(rad_values, dtype=np.float64)
-
-    if az_count < N:
-        step = az_list[-1] - az_list[-2] if len(az_list) > 1 else 0
-        extra = np.arange(az_list[-1] + step, az_list[-1] + step*(N - az_count + 1), step)
-        az_list = np.concatenate([az_list, extra[:N - az_count]])
-
-    if rad_count < N:
-        step = rad_list[-1] - rad_list[-2] if len(rad_list) > 1 else 0
-        extra = np.arange(rad_list[-1] + step, rad_list[-1] + step*(N - rad_count + 1), step)
-        rad_list = np.concatenate([rad_list, extra[:N - rad_count]])
-
-    # set up empty arrays for our epfl fields
-    spectra = np.zeros((num_phi, num_theta, num_channels, N, N), dtype=np.float32)
-    luminance = np.zeros((num_phi, num_theta, N, N), dtype=np.float32)
-    vndf = np.zeros((num_phi, num_theta, N, N), dtype=np.float32)
-    ndf = np.zeros((num_phi, num_theta), dtype=np.float32)
-    sigma = np.zeros((num_phi, num_theta), dtype=np.float32)
-
-    # fill in the data from our zemax blocks
-    for r in range(num_phi):
-        for m in range(num_theta):
+    for t in range(num_theta):
+        for p in range(num_phi):
+            idx = t*num_phi + p
             for ch in range(num_channels):
-                mat = blocks[ch]['values'][(r, m)]
-                pad = np.zeros((N, N), dtype=np.float32)
-                pad[:mat.shape[0], :mat.shape[1]] = mat
-                spectra[r, m, ch, :, :] = pad
+                mat = blocks[ch]['values'][(t, p)]
+                # mat is shape (az_count, rad_count), we want (rad_count, az_count)
+                mat = mat.T
+                spectra[t,p,ch,:,:] = mat
 
-            # if we have xyz, let's use the y channel as luminance, or use the only channel if monochrome
-            if num_channels == 3:
-                luminance[r, m, :, :] = spectra[r, m, 1, :, :]
+            if idx < len(blocks[0]['TIS']):
+                sigma[t,p] = blocks[0]['TIS'][idx]
             else:
-                luminance[r, m, :, :] = spectra[r, m, 0, :, :]
+                sigma[t,p] = 1.0
 
-            # store tis in sigma, and set ndf to the specular peak (the first cell)
-            idx = r * num_theta + m
-            sigma[r, m] = blocks[0]['TIS'][idx] if idx < len(blocks[0]['TIS']) else 1.0
-            ndf[r, m] = float(luminance[r, m, 0, 0])
+    # luminance => (theta, phi, rad, az), pick y channel if we have 3, else channel0
+    luminance = np.zeros((num_theta, num_phi, rad_count, az_count), dtype=np.float32)
+    if num_channels == 3:
+        luminance[:] = spectra[:, :, 1, :, :]
+    else:
+        luminance[:] = spectra[:, :, 0, :, :]
 
-    # approximate vndf by doing brdf * cos(theta_in)
-    Alpha, Delta = np.meshgrid(np.radians(az_list), np.radians(rad_list), indexing='ij')
-    for r in range(num_phi):
-        for m in range(num_theta):
-            A = math.radians(theta_i[m])
-            cosA, sinA = math.cos(A), math.sin(A)
-            cos_theta_in = cosA * np.cos(Delta) + sinA * np.cos(Alpha) * np.sin(Delta)
-            cos_theta_in = np.clip(cos_theta_in, 0.0, 1.0)
-            vndf[r, m, :, :] = luminance[r, m, :, :] * cos_theta_in
+    # vndf => same shape, we do cos factor
+    vndf = np.zeros_like(luminance)
+    alpha_grid, delta_grid = np.meshgrid(
+        np.radians(az_values), np.radians(rad_values), indexing='ij'
+    )
+    alpha_grid = alpha_grid.astype(np.float32)
+    delta_grid = delta_grid.astype(np.float32)
 
-    # add a casual text note about where this file came from
+    for t in range(num_theta):
+        for p in range(num_phi):
+            a_val = math.radians(phi_i[p])
+            cosA, sinA = math.cos(a_val), math.sin(a_val)
+            for r_ in range(rad_count):
+                for a_ in range(az_count):
+                    alpha = alpha_grid[a_, r_]
+                    delta = delta_grid[a_, r_]
+                    c_in = cosA*math.cos(delta) + sinA*math.cos(alpha)*math.sin(delta)
+                    c_in = max(c_in, 0.0)
+                    vndf[t,p,r_,a_] = luminance[t,p,r_,a_] * c_in
+
+    # build rgb => shape (theta, phi, 3, rad, az)
+    if num_channels == 3:
+        xyz_to_rgb = np.array([
+            [ 3.2406, -1.5372, -0.4986],
+            [-0.9689,  1.8758,  0.0415],
+            [ 0.0557, -0.2040,  1.0570]
+        ], dtype=np.float32)
+        X = spectra[:,:,0,:,:]
+        Y = spectra[:,:,1,:,:]
+        Z = spectra[:,:,2,:,:]
+
+        R = xyz_to_rgb[0,0]*X + xyz_to_rgb[0,1]*Y + xyz_to_rgb[0,2]*Z
+        G = xyz_to_rgb[1,0]*X + xyz_to_rgb[1,1]*Y + xyz_to_rgb[1,2]*Z
+        B = xyz_to_rgb[2,0]*X + xyz_to_rgb[2,1]*Y + xyz_to_rgb[2,2]*Z
+
+        rgb = np.zeros((num_theta, num_phi, 3, rad_count, az_count), dtype=np.float32)
+        rgb[:, :, 0, :, :] = R
+        rgb[:, :, 1, :, :] = G
+        rgb[:, :, 2, :, :] = B
+    else:
+        c = spectra[:,:,0,:,:]
+        rgb = np.zeros((num_theta, num_phi, 3, rad_count, az_count), dtype=np.float32)
+        rgb[:, :, 0, :, :] = c
+        rgb[:, :, 1, :, :] = c
+        rgb[:, :, 2, :, :] = c
+
+    # if total number of elements in (theta, phi, rad, az) not multiple of 8 => pad rad_count
+    total_elems = num_theta * num_phi * rad_count * az_count
+    if total_elems % 8 != 0:
+        needed_bits = 8 - (total_elems % 8)
+        per_col = num_theta * num_phi * az_count
+        extra_cols = (needed_bits + per_col - 1)//per_col
+
+        new_rad_count = rad_count + extra_cols
+        new_total = num_theta * num_phi * new_rad_count * az_count
+        if new_total % 8 != 0:
+            raise ValueError("padding logic error: still not multiple of 8")
+
+        if len(rad_values) > 1:
+            step = rad_values[-1] - rad_values[-2]
+            if step == 0:
+                step = 5.0
+        else:
+            step = 5.0
+
+        pads = []
+        current = rad_values[-1]
+        for _ in range(extra_cols):
+            current += step
+            pads.append(current)
+        rad_values = list(rad_values) + pads
+
+        new_spectra = np.zeros((num_theta, num_phi, num_channels, new_rad_count, az_count), dtype=np.float32)
+        new_luminance = np.zeros((num_theta, num_phi, new_rad_count, az_count), dtype=np.float32)
+        new_vndf = np.zeros((num_theta, num_phi, new_rad_count, az_count), dtype=np.float32)
+        new_rgb = np.zeros((num_theta, num_phi, 3, new_rad_count, az_count), dtype=np.float32)
+
+        new_spectra[:,:,:,:rad_count,:] = spectra
+        new_luminance[:,:,:rad_count,:] = luminance
+        new_vndf[:,:,:rad_count,:] = vndf
+        new_rgb[:,:,:,:rad_count,:] = rgb
+
+        rad_count = new_rad_count
+        spectra = new_spectra
+        luminance = new_luminance
+        vndf = new_vndf
+        rgb = new_rgb
+
+    # build valid => shape (theta, phi, rad, az)
+    valid_bool = np.ones((num_theta, num_phi, rad_count, az_count), dtype=bool)
+    old_original_rad = blocks[0]['values'][(0,0)].shape[1]
+    if rad_count> old_original_rad:
+        valid_bool[:,:,old_original_rad:, :] = False
+
+    valid_flat = valid_bool.reshape(-1)
+    valid_bits = np.packbits(valid_flat)
+
+    # clamp negative or inf in rgb
+    rgb = np.nan_to_num(rgb, nan=0.0, posinf=1e4, neginf=0.0)
+    rgb = np.maximum(rgb, 0.0)
+
+    # convert rad_values, az_values to arrays
+    rad_values = np.array(rad_values, dtype=np.float32)
+    az_values = np.array(az_values, dtype=np.float32)
+
+    # short text desc
     desc_text = f"converted from zemax bsdf (symmetry={symmetry}, type={scatter_type})"
     description = np.frombuffer(desc_text.encode('utf-8'), dtype=np.uint8)
-
-    # the jacobian is just a flag, we'll say 0 for none
     jacobian = np.array([0], dtype=np.uint8)
 
-    # now we write everything to a binary .bsdf file
+    # gather fields for the final .bsdf
+    fields = [
+        ("theta_i", theta_i),
+        ("phi_i", phi_i),
+        ("wavelengths", wavelengths),
+        ("spectra", spectra),
+        ("luminance", luminance),
+        ("sigma", sigma),
+        ("vndf", vndf),
+        ("rgb", rgb),
+        ("valid", valid_bits),
+        ("rad_values", rad_values),
+        ("az_values", az_values),
+        ("description", description),
+        ("jacobian", jacobian),
+    ]
+
+    # write epfl binary format
     with open(output_path, 'wb') as f:
-        # write our special header
         f.write(b"tensor_file\x00")
         f.write(struct.pack('<BB', 1, 0))
-
-        # list all the fields we plan to write, then say how many there are
-        fields = [
-            ("theta_i", theta_i),
-            ("phi_i", phi_i),
-            ("ndf", ndf),
-            ("sigma", sigma),
-            ("vndf", vndf),
-            ("luminance", luminance),
-            ("spectra", spectra),
-            ("wavelengths", wavelengths),
-            ("description", description),
-            ("jacobian", jacobian)
-        ]
         f.write(struct.pack('<I', len(fields)))
 
-        # figure out how big all the field descriptors will be so we know where data starts
+        dtype_map = {
+            np.dtype('uint8'): 1,
+            np.dtype('int8'): 2,
+            np.dtype('uint16'): 3,
+            np.dtype('int16'): 4,
+            np.dtype('uint32'): 5,
+            np.dtype('int32'): 6,
+            np.dtype('uint64'): 7,
+            np.dtype('int64'): 8,
+            np.dtype('float16'): 9,
+            np.dtype('float32'): 10,
+            np.dtype('float64'): 11
+        }
+
         descriptors_len = 0
+        for name, arr in fields:
+            arr = np.array(arr, copy=False)
+            ndim = arr.ndim
+            name_len = len(name.encode('utf-8'))
+            descriptors_len += 2 + name_len + 2 + 1 + 8 + 8*ndim
+
+        data_offset = 12 + 2 + 4 + descriptors_len
+        current_offset = data_offset
+
         for name, arr in fields:
             arr = np.array(arr, copy=False)
             name_bytes = name.encode('utf-8')
             ndim = arr.ndim
-            descriptors_len += 2 + len(name_bytes) + 2 + 1 + 8 + 8*ndim
 
-        # total offset is header size + descriptors
-        data_offset = 12 + 2 + 4 + descriptors_len
-        current_offset = data_offset
-
-        # define numeric codes for each data type
-        dtype_code = {
-            np.dtype('uint8'): 1,
-            np.dtype('uint16'): 2,
-            np.dtype('uint32'): 3,
-            np.dtype('uint64'): 4,
-            np.dtype('int8'): 5,
-            np.dtype('int16'): 6,
-            np.dtype('int32'): 7,
-            np.dtype('int64'): 8,
-            np.dtype('float32'): 9,
-            np.dtype('float64'): 10
-        }
-
-        # write each field's descriptor
-        for name, arr in fields:
-            arr = np.array(arr, copy=False)
-            name_bytes = name.encode('utf-8')
-
-            # field name length and the name
             f.write(struct.pack('<H', len(name_bytes)))
             f.write(name_bytes)
+            f.write(struct.pack('<H', ndim))
 
-            # number of dimensions, data type, offset
-            f.write(struct.pack('<H', arr.ndim))
-            f.write(struct.pack('<B', dtype_code[arr.dtype]))
+            if arr.dtype not in dtype_map:
+                raise ValueError(f"unsupported dtype: {arr.dtype}")
+            f.write(struct.pack('<B', dtype_map[arr.dtype]))
+
             f.write(struct.pack('<Q', current_offset))
-
-            # store the size of each dimension
-            for dim in arr.shape:
-                f.write(struct.pack('<Q', dim))
+            for s in arr.shape:
+                f.write(struct.pack('<Q', s))
 
             current_offset += arr.nbytes
 
-        # finally write the raw data for each field
-        for name, arr in fields:
+        for _, arr in fields:
             arr = np.array(arr, copy=False)
             f.write(arr.tobytes())
 
@@ -223,12 +288,12 @@ def main():
         print("usage: python convert_bsdf.py <input.zmx.bsdf> <output.epfl.bsdf>")
         sys.exit(1)
 
-    inp_file, out_file = sys.argv[1], sys.argv[2]
-    with open(inp_file, 'r') as f_in:
-        zmx_text = f_in.read()
+    inp, out = sys.argv[1], sys.argv[2]
+    with open(inp, 'r') as f:
+        zmx_text = f.read()
 
-    convert_zemax_to_epfl(zmx_text, out_file)
-    print(f"converted '{inp_file}' to '{out_file}'.")
+    convert_zemax_to_epfl(zmx_text, out)
+    print(f"converted '{inp}' to '{out}'.")
 
 if __name__ == "__main__":
     main()
