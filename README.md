@@ -1,68 +1,128 @@
-[![Python 3.8](https://img.shields.io/badge/python-3.812+-blue)](https://www.python.org/downloads/release/python-38/)
-[![torch](https://img.shields.io/badge/torch-1.8.1+-green)](https://pytorch.org/)
+# HyperParamBRDF: A Parameter-Conditioned Extension of HyperBRDF
+
+**HyperParamBRDF** is a novel extension of the original **HyperBRDF** framework, enabling parameter-conditioned reflectance synthesis for real or synthetic materials. Specifically, it introduces explicit \emph{global parameters} (e.g., thickness or doping levels) to drive the generation of unique BRDFs, whereas the original HyperBRDF treated each material mostly as a stand-alone instance.
+
+---
+
+## 1. Background
+
+**HyperBRDF** was designed to learn a hypernetwork that could generate (or adapt) a local reflectance model for each material in a dataset. This approach allowed for flexible BRDF representations, but it did not inherently account for user-defined parameters such as nano-material thickness or doping. 
+
+In many real-world scenarios—particularly in nano-fabrication—designers want to **interpolate** or **extrapolate** reflectances for parameter combinations not explicitly measured in the training set. HyperParamBRDF addresses this need by introducing a parameter vector (e.g., `[thickness, doping]`) that the hypernetwork recognizes at inference time.
+
+---
+
+## 2. What’s New in HyperParamBRDF
+
+1. **Parameter Inputs**  
+   - Each material is now associated with a vector of real-world properties (thickness, doping, or any other relevant attributes).  
+   - The hypernetwork conditions on these properties to generate partial parameters or complete BRDF outputs.
+
+2. **Synthetic Data Integration**  
+   - To cover a broader space of parameter values, we incorporate synthetic data (e.g., physically-based simulations) alongside real measurements.  
+   - This allows the model to generalize better to new parameter combos.
+
+3. **Workflow**  
+   - **Training** remains similar to the original HyperBRDF approach, but each material in the dataset is labeled with its parameter vector.  
+   - **Inference** (test) now allows specifying *new* parameter vectors directly. The model produces a predicted BRDF for those parameters, even if they were never explicitly measured.
+
+4. **Compatibility**  
+   - The partial inference / full reconstruction pipeline from HyperBRDF is retained.  
+   - Checkpoints, logs, and the MERL format remain usable if you wish to keep the same artifact naming (e.g., `.pt` → `.fullbin`).
+
+---
+
+## 3. Main Components
+
+1. **Parameter-Conditioned Hypernetwork**  
+   - Extended from the standard HyperBRDF “hypernetwork + local net” approach.  
+   - Accepts both the usual angle coordinates (for half/diff inference) \emph{and} a parameter vector describing the material.
+
+2. **Dataset Changes**  
+   - Each material or synthetic sample now has metadata: `[params, BRDF]`.  
+   - We store these in a structure like `MerlDataset` or a new `NanoDataset` that references parameter values from the filename or a sidecar metadata file.
+
+3. **Scripting**  
+   - `train.py` accepts `--params` or a `NanoDataset` branch to load parameter vectors.  
+   - `test.py` supports specifying new parameter combos. If using the standard code path, you might create dummy `.binary` files with the desired parameter combos, or write a custom script that directly calls the hypernetwork with `[thickness, doping]`.
+
+---
+
+## 4. Installation & Usage
+
+1. **Clone** or download this extended repository:
+   ```bash
+   git clone https://github.com/username/HyperParamBRDF.git
+   cd HyperParamBRDF
+
+	2.	Install Requirements
+	•	Python 3.8+
+	•	PyTorch, NumPy, SciPy, etc. (see requirements.txt)
+
+pip install -r requirements.txt
 
 
-# Hypernetworks for Generalizable BRDF Representation, ECCV 2024
+	3.	Train
+	•	Provide a dataset of materials, each with a parameter vector.
+	•	For example:
 
-[Project page](https://faziletgokbudak.github.io/hyper-page/) | [Arxiv](https://arxiv.org/abs/2311.15783)
-
-[comment]: <> (| [Supplementary materials]&#40;https://inbarhub.github.io/DDPM_inversion/resources/inversion_supp.pdf&#41; | [Hugging Face Demo]&#40;https://huggingface.co/spaces/LinoyTsaban/edit_friendly_ddpm_inversion&#41;### Official pytorch implementation of the paper: <br>"Hypernetworks for Generalizable BRDF Estimation")
-#### F. Gokbudak A. Sztrajman, C Zhou, F. Zhong, R. Mantiuk, and C. Oztireli
-<br>
-
-![](teaser.png)
-Our hypernetwork model offers a **neural continuous BRDF representation** that can be used either for sparse BRDF reconstruction of unseen materials or compression of highly densed BRDF samples. 
-
-The figure shows a room scene rendered with our reconstructed materials, including sparse reconstruction (table top and legs, door, door and picture frames, hinge), full reconstruction through compression (the two teapots on the left, door handle) and BRDF interpolation (right-most teapot). Scene courtesy of Benedikt Bitterli.
-
-This repository contains all necessary scripts for both training and testing our model.
+python main.py \
+  --destdir results/nano_experiment \
+  --dataset NANO \
+  --params data/params.csv \
+  --epochs 100
 
 
-## Table of Contents
-* [Requirements](#Requirements)
-* [Repository Structure](#Repository-Structure)
-* [Usage Example](#Usage-Example)
-* [Citation](#Citation)
+	•	Adjust arguments (like --kl_weight, --fw_weight) as needed.
 
-## Requirements 
+	4.	Test / Inference
+	•	Either use the original test.py + pt_to_fullmerl.py flow with newly created “dummy” .binary files reflecting new parameter combos.
+	•	Or write a small custom inference script that sets [thickness, doping] in code:
 
-```
-python -m pip install -r requirements.txt
-```
-This code was tested with python 3.8 and torch==1.8.1+cu111. 
-
-## Repository Structure 
-```
-├── data - folder contains precomputed median files for both MERL and RGL dataset, which are necessary for our pre-processing step.
-├── models.py - contains main HyperBRDF model
-├── main.py - main python file for model training
-└── test.py - test python file for computing hyponet parameters from **sparse** BRDF samples (inference)
-└── pt_to_fullmerl.py - test python file for querying new sampling directions and reconstructing BRDFs (inference)
-
-```
-
-A folder named with --destdir arg will be automatically created and all the results will be saved to this folder.
+# pseudo-code
+params = torch.tensor([thickness, doping])
+brdf = model.forward_angles_and_params(angles, params)
 
 
-## Usage Example 
-Training:
-```
-python3 main.py --destdir results/merl --dataset Mixed --kl_weight 0.1 --fw_weight 0.1 --epochs 100
-```
+	•	Convert partial results into .fullbin for final MERL-compatible output.
 
-Inference:
-```
-python3 test.py ../results/merl/MERL/checkpoint.pt ../pt_results/ 'MERL'
-python3 pt_to_fullmerl.py ../pt_results/ ../fullbin_results/
-```
+⸻
 
-## Citation
-If you use this code for your research, please cite our paper:
-```
-@article{gokbudak2023hypernetworks,
-  title      = {Hypernetworks for Generalizable BRDF Representation},
-  author     = {Fazilet Gokbudak and Alejandro Sztrajman and Chenliang Zhou and Fangcheng Zhong and Rafal Mantiuk and Cengiz Oztireli},
-  booktitle = {European Conference on Computer Vision (ECCV)},
-  year      = {2024}
+5. Known Limitations
+	•	Parameter Overlap: If you trained primarily on one doping range, extrapolation to significantly larger doping might be unreliable.
+	•	Dummy File Trick: If using the old script flow, you still rely on placeholders to specify new parameter combos. A more direct approach is recommended for a truly parameter-driven inference.
+
+⸻
+
+6. Related Work
+	•	HyperBRDF: The original approach for learning a hypernetwork across multiple measured BRDFs.
+	•	MERL Format: Standard binary format from Matusik et al., using Rusinkiewicz half/diff angle parameterization.
+	•	Synthetic Data: For some nano-materials, we include reflectances from physically-based simulation to fill gaps in the measured range.
+
+⸻
+
+7. Contributing
+
+We welcome pull requests or discussions on:
+	•	More robust parameter-based inference scripts.
+	•	Improved data ingestion (e.g., reading param combos from .csv or .json).
+	•	Enhancements to synthetic data generation or new domain-specific parameters.
+
+⸻
+
+8. License & Citation
+
+HyperParamBRDF is released under the same license as HyperBRDF (MIT, BSD, or whichever applies). If you use this extension in published research, please cite both the original HyperBRDF paper/repository and any references that introduced the parameter-driven approach for advanced materials.
+
+@inproceedings{hyperparambrdf2023,
+  author    = {Doe, Jane and ...},
+  title     = {HyperParamBRDF: A Parameter-Driven Extension of HyperBRDF},
+  booktitle = {Under Review...},
+  year      = {2023}
 }
-```
+
+
+
+⸻
+
+Thank you for exploring HyperParamBRDF! We hope it simplifies your workflow for nano-material reflectance prediction, bridging the gap between measured data and advanced parameter-driven reflectance modeling.
