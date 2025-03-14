@@ -151,11 +151,18 @@ def convert_zemax_to_epfl(zmx_text, output_path):
 
     # if total number of elements in (theta, phi, rad, az) not multiple of 8 => pad rad_count
     total_elems = num_theta * num_phi * rad_count * az_count
-    if total_elems % 8 != 0:
-        needed_bits = 8 - (total_elems % 8)
-        per_col = num_theta * num_phi * az_count
-        extra_cols = (needed_bits + per_col - 1)//per_col
 
+    remainder = total_elems % 8
+    if remainder != 0:
+        # figure out how many columns we must add so total becomes multiple of 8
+        per_col = num_theta * num_phi * az_count
+        extra_cols = 0
+        while True:
+            test_total = total_elems + extra_cols * per_col
+            if test_total % 8 == 0:
+                break
+            extra_cols += 1
+            
         new_rad_count = rad_count + extra_cols
         new_total = num_theta * num_phi * new_rad_count * az_count
         if new_total % 8 != 0:
