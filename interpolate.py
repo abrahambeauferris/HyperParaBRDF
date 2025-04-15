@@ -4,8 +4,8 @@ import os
 import shutil
 
 # Adjust these paths to fit your directory structure
-SOURCE_DIR = "data/nano"        # Where your original .brdf.binary files live
-DEST_DIR = "data/nano"          # Where we'll put the dummy copies (could be the same as SOURCE_DIR)
+SOURCE_DIR = "/Users/abraham/Documents/GitHub/HyperBRDF/data/nano/nano_v2"        # Where your original .brdf.binary files live
+DEST_DIR = "/Users/abraham/Documents/GitHub/HyperBRDF/data/nano/nano_v2"          # Where we'll put the dummy copies (could be the same as SOURCE_DIR)
 
 # Define 5 "interpolation" (thickness, doping) combos
 INTERPOLATIONS = [
